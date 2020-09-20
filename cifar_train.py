@@ -7,6 +7,7 @@ import sys
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.nn.parallel
 import torch.backends.cudnn as cudnn
 import torch.optim
@@ -19,7 +20,11 @@ from tensorboardX import SummaryWriter
 from sklearn.metrics import confusion_matrix
 from utils import *
 from imbalance_cifar import IMBALANCECIFAR10, IMBALANCECIFAR100
-from losses import LDAMLoss, FocalLoss
+from losses import LDAMLoss, FocalLoss, SigLoss, SoftLoss, GCELoss
+
+
+def softmax_scale(x):
+    return np.exp(x)/sum(np.exp(x))
 
 model_names = sorted(name for name in models.__dict__
     if name.islower() and not name.startswith("__")
@@ -66,8 +71,10 @@ parser.add_argument('--seed', default=None, type=int,
                     help='seed for initializing training. ')
 parser.add_argument('--gpu', default=None, type=int,
                     help='GPU id to use.')
-parser.add_argument('--root_log',type=str, default='log')
+parser.add_argument('--root_log', type=str, default='log')
 parser.add_argument('--root_model', type=str, default='checkpoint')
+
+parser.add_argument('--visual', type=bool, default=False)
 best_acc1 = 0
 
 
@@ -207,39 +214,111 @@ def main_worker(gpu, ngpus_per_node, args):
         else:
             warnings.warn('Sample rule is not listed')
         
+
+
+        # CHOOSE LOSS
+        np_num_list = np.array(cls_num_list)
+        np_num_all = np.sum(np_num_list)
+        cf_mat = get_confusion_mat(num_classes)
+        weight_list_down = np_num_list / np_num_all
+        weight_list_up = (1. / np_num_list) / (np.sum(1. / np_num_list))
+        weight_mat = np.zeros(shape=(num_classes, num_classes))
         if args.loss_type == 'CE':
             criterion = nn.CrossEntropyLoss(weight=per_cls_weights).cuda(args.gpu)
         elif args.loss_type == 'LDAM':
             criterion = LDAMLoss(cls_num_list=cls_num_list, max_m=0.5, s=30, weight=per_cls_weights).cuda(args.gpu)
         elif args.loss_type == 'Focal':
             criterion = FocalLoss(weight=per_cls_weights, gamma=1).cuda(args.gpu)
+        elif args.loss_type == 'Sig':
+            # structure
+            for i in range(num_classes):
+                eps = (np.sum(cf_mat[i]) - cf_mat[i][i]) / (num_classes - 1)
+                # eps = 1
+                weight_mat[i] = (cf_mat[i] + eps) / (np.sum(cf_mat[i] + eps) - (cf_mat[i][i] + eps))
+                weight_mat[i][i] = 1
+
+            # imbalanced
+            # for i in range(num_classes):
+            #     weight_mat[i] = weight_list_down
+            #     weight_mat[i][i] = weight_list_up[i] * num_classes
+
+            criterion = SigLoss(class_num=num_classes, weight_mat=weight_mat).cuda(args.gpu)
+        elif args.loss_type == 'Soft':
+            # structure
+            for i in range(num_classes):
+                eps = (np.sum(cf_mat[i]) - cf_mat[i][i]) / (num_classes - 1)
+                # eps = 1
+                weight_mat[i] = (cf_mat[i] + eps) / (np.sum(cf_mat[i] + eps) - (cf_mat[i][i] + eps))
+                weight_mat[i][i] = 0
+
+            # imbalanced
+            # for i in range(num_classes):
+            #     weight_mat[i] = weight_list_down
+            #     weight_mat[i][i] = 0
+
+            criterion = SoftLoss(class_num=num_classes, weight_mat=weight_mat).cuda(args.gpu)
+        elif args.loss_type in ['gce', 'GCE'] :
+            # structure
+            # for i in range(num_classes):
+            #     eps = (np.sum(cf_mat[i]) - cf_mat[i][i]) / (num_classes - 1)
+            #     # eps = 1
+            #     weight_mat[i] = (cf_mat[i] + eps) / (np.sum(cf_mat[i] + eps) - (cf_mat[i][i] + eps))
+            #     weight_mat[i][i] = 1
+            # cond = weight_mat >= 1 / num_classes
+            # weight_mat = np.where(cond, 1, 0)
+
+            # imbalanced
+            # for i in range(num_classes):
+            #     weight_mat[i] = weight_list_down
+            #     weight_mat[i][i] = 0
+
+            # bernoulli for structure
+            # for i in range(num_classes):
+            #     cf_mat[i][i] = 0
+            #     m = np.max(cf_mat[i])
+            #     weight_mat[i] = cf_mat[i] / m
+            #     weight_mat[i][i] = 1
+
+            # bernoulli for imbalanced
+            # for i in range(num_classes):
+            #     weight_mat[i] = np_num_list / (np_num_all - np_num_list[i])
+            #     weight_mat[i][i] = 0
+            #     m = np.max(weight_mat[i])
+            #     weight_mat[i] = weight_mat[i] / m
+            #     weight_mat[i][i] = 1
+            if(epoch < 100):
+                criterion = nn.CrossEntropyLoss(weight=per_cls_weights).cuda(args.gpu)
+            else:
+                criterion = GCELoss(class_num=num_classes, weight_mat=None).cuda(args.gpu)
         else:
             warnings.warn('Loss type is not listed')
             return
 
         # train for one epoch
-        train(train_loader, model, criterion, optimizer, epoch, args, log_training, tf_writer)
+        if(not args.visual):
+            train(train_loader, model, criterion, optimizer, epoch, args, log_training, tf_writer)
         
         # evaluate on validation set
         acc1 = validate(val_loader, model, criterion, epoch, args, log_testing, tf_writer)
 
         # remember best acc@1 and save checkpoint
-        is_best = acc1 > best_acc1
-        best_acc1 = max(acc1, best_acc1)
+        if(not args.visual):
+            is_best = acc1 > best_acc1
+            best_acc1 = max(acc1, best_acc1)
 
-        tf_writer.add_scalar('acc/test_top1_best', best_acc1, epoch)
-        output_best = 'Best Prec@1: %.3f\n' % (best_acc1)
-        print(output_best)
-        log_testing.write(output_best + '\n')
-        log_testing.flush()
+            tf_writer.add_scalar('acc/test_top1_best', best_acc1, epoch)
+            output_best = 'Best Prec@1: %.3f\n' % (best_acc1)
+            print(output_best)
+            log_testing.write(output_best + '\n')
+            log_testing.flush()
 
-        save_checkpoint(args, {
-            'epoch': epoch + 1,
-            'arch': args.arch,
-            'state_dict': model.state_dict(),
-            'best_acc1': best_acc1,
-            'optimizer' : optimizer.state_dict(),
-        }, is_best)
+            save_checkpoint(args, {
+                'epoch': epoch + 1,
+                'arch': args.arch,
+                'state_dict': model.state_dict(),
+                'best_acc1': best_acc1,
+                'optimizer' : optimizer.state_dict(),
+            }, is_best)
 
 
 def train(train_loader, model, criterion, optimizer, epoch, args, log, tf_writer):
@@ -308,6 +387,7 @@ def validate(val_loader, model, criterion, epoch, args, log=None, tf_writer=None
     model.eval()
     all_preds = []
     all_targets = []
+    all_output = []
     with torch.no_grad():
         end = time.time()
         for i, (input, target) in enumerate(val_loader):
@@ -317,6 +397,8 @@ def validate(val_loader, model, criterion, epoch, args, log=None, tf_writer=None
 
             # compute output
             output = model(input)
+            if(args.visual):
+                all_output.extend(F.softmax(output).cpu().numpy())
             loss = criterion(output, target)
 
             # measure accuracy and record loss
@@ -339,29 +421,46 @@ def validate(val_loader, model, criterion, epoch, args, log=None, tf_writer=None
                           'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
                           'Prec@1 {top1.val:.3f} ({top1.avg:.3f})\t'
                           'Prec@5 {top5.val:.3f} ({top5.avg:.3f})'.format(
-                    i, len(val_loader), batch_time=batch_time, loss=losses,
-                    top1=top1, top5=top5))
+                            i, len(val_loader), batch_time=batch_time, loss=losses,
+                            top1=top1, top5=top5))
                 print(output)
+        
         cf = confusion_matrix(all_targets, all_preds).astype(float)
+        if(args.visual):
+            prob_mat = np.zeros_like(cf)
+            print(all_targets[:5])
+            print(all_output[:5])
+            for i,prob in enumerate(all_output):
+                prob_mat[all_targets[i]] += prob
+            print('prob:')
+            print(prob_mat.astype(int))
+            print('cf:')
+            print(cf.astype(int))
+        if(epoch % 5 == 0):
+            print(cf)
+
         cls_cnt = cf.sum(axis=1)
         cls_hit = np.diag(cf)
         cls_acc = cls_hit / cls_cnt
         output = ('{flag} Results: Prec@1 {top1.avg:.3f} Prec@5 {top5.avg:.3f} Loss {loss.avg:.5f}'
                 .format(flag=flag, top1=top1, top5=top5, loss=losses))
-        out_cls_acc = '%s Class Accuracy: %s'%(flag,(np.array2string(cls_acc, separator=',', formatter={'float_kind':lambda x: "%.3f" % x})))
+        out_cls_acc = '%s Class Accuracy: %s' % (flag, (np.array2string(cls_acc, separator=',', formatter={'float_kind':lambda x: "%.3f" % x})))
         print(output)
         print(out_cls_acc)
-        if log is not None:
-            log.write(output + '\n')
-            log.write(out_cls_acc + '\n')
-            log.flush()
 
-        tf_writer.add_scalar('loss/test_'+ flag, losses.avg, epoch)
-        tf_writer.add_scalar('acc/test_' + flag + '_top1', top1.avg, epoch)
-        tf_writer.add_scalar('acc/test_' + flag + '_top5', top5.avg, epoch)
-        tf_writer.add_scalars('acc/test_' + flag + '_cls_acc', {str(i):x for i, x in enumerate(cls_acc)}, epoch)
+        if(not args.visual):
+            if log is not None:
+                log.write(output + '\n')
+                log.write(out_cls_acc + '\n')
+                log.flush()
+
+            tf_writer.add_scalar('loss/test_'+ flag, losses.avg, epoch)
+            tf_writer.add_scalar('acc/test_' + flag + '_top1', top1.avg, epoch)
+            tf_writer.add_scalar('acc/test_' + flag + '_top5', top5.avg, epoch)
+            tf_writer.add_scalars('acc/test_' + flag + '_cls_acc', {str(i):x for i, x in enumerate(cls_acc)}, epoch)
 
     return top1.avg
+
 
 def adjust_learning_rate(optimizer, epoch, args):
     """Sets the learning rate to the initial LR decayed by 10 every 30 epochs"""
@@ -369,13 +468,14 @@ def adjust_learning_rate(optimizer, epoch, args):
     if epoch <= 5:
         lr = args.lr * epoch / 5
     elif epoch > 180:
-        lr = args.lr * 0.0001
-    elif epoch > 160:
         lr = args.lr * 0.01
+    elif epoch > 160:
+        lr = args.lr * 0.1
     else:
         lr = args.lr
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
+
 
 if __name__ == '__main__':
     main()

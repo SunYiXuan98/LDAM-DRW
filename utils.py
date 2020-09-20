@@ -173,3 +173,36 @@ def accuracy(output, target, topk=(1,)):
             correct_k = correct[:k].view(-1).float().sum(0, keepdim=True)
             res.append(correct_k.mul_(100.0 / batch_size))
         return res
+
+
+def get_confusion_mat(num_classes):
+    cf_mat = np.load('./record/cf_balanced_saved.npy')
+    # cf_mat = cf_mat + cf_mat.T
+    # w_mat = np.ones((num_classes, num_classes))
+    # eps = 1
+
+    # 只对大类结构抑制
+    # for i in range(num_classes):
+    #     nums_down = np.sum(cf_mat[i, :i])
+    #     for j in range(i):
+    #         w_mat[i][j] = (cf_mat[i][j] + eps) / (nums_down + eps)
+
+    # 全部类结构抑制
+    # for i in range(num_classes):
+    #     nums_down = np.sum(cf_mat[i]) - cf_mat[i][i]
+    #     for j in range(num_classes):
+    #         w_mat[i][j] = (cf_mat[i][j] + eps) / (nums_down + eps)
+    #     w_mat[i][i] = 0.
+
+    return cf_mat
+
+def get_prob_mat(num_classes):
+    prob_mat = np.load('./record/prob_mat.npy')
+
+    return prob_mat
+
+if __name__ == '__main__':
+    # a = np.load('./record/cf_balanced_saved.npy')
+    # print(a.T + a)
+    x=np.arange(16).reshape((4,4))
+    print(x[[1,2],[1,2]])
