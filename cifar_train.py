@@ -75,7 +75,7 @@ parser.add_argument('--root_log', type=str, default='log')
 parser.add_argument('--root_model', type=str, default='checkpoint')
 
 parser.add_argument('--visual', type=bool, default=False)
-parser.add_argument('--soft_topk', type=int, default=0)
+parser.add_argument('--RLDAM_k', type=int, default=0)
 args = parser.parse_args()
 best_acc1 = 0
 num_classes = 100 if args.dataset == 'cifar100' else 10
@@ -305,6 +305,22 @@ def main_worker(gpu, ngpus_per_node, args):
                 criterion = nn.CrossEntropyLoss(weight=per_cls_weights).cuda(args.gpu)
             else:
                 criterion = GCELoss(class_num=num_classes, weight_mat=None).cuda(args.gpu)
+        elif args.loss_type == 'RLDAM':
+            # structure
+            weight_mat = np.zeros(shape=(num_classes, num_classes))
+            C = 0.5
+            for i in range(num_classes):
+                cf_mat[i][i] = 0
+                index_topk = cf_mat[i].argsort()[-args.RLDAM_k:][::-1]
+                for j,idx in enumerate(index_topk):
+                    weight_mat[i][idx] = (args.RLDAM_k - j) * C
+
+            # imbalanced
+            # for i in range(num_classes):
+            #     weight_mat[i] = weight_list_down
+            #     weight_mat[i][i] = 0
+
+            criterion = SoftLoss(class_num=num_classes, weight_mat=weight_mat).cuda(args.gpu)
         else:
             warnings.warn('Loss type is not listed')
             return
@@ -461,6 +477,7 @@ def validate(val_loader, model, criterion, epoch, args, log=None, tf_writer=None
         if(args.visual):
             print('cf:')
             print(cf.astype(int))
+            # np.save('./record/cf100.npy', cf)
             for i in range(num_classes):
                 np_features_class = np.array(features_classes[i])
                 i_mean = np.mean(np_features_class, axis=0)

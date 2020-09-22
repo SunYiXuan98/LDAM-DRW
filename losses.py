@@ -74,7 +74,7 @@ class SigLoss(nn.Module):
 
 
 class SoftLoss(nn.Module):
-    def __init__(self, class_num=10, weight_mat=None):
+    def __init__(self, class_num=10, weight_mat=None, s=3):
         super(SoftLoss, self).__init__()
         self.class_num = class_num
         self.weight_mat = torch.tensor(weight_mat)
@@ -136,3 +136,28 @@ class GCELoss(nn.Module):
         batch_loss = (-logits_for_labels + exp_sum_log).sum()
 
         return batch_loss / len(labels)
+
+
+class RLDAMLoss(nn.Module):
+    
+    def __init__(self, class_num=10, weight_mat=None, weight=None, s=30):
+        super(RLDAMLoss, self).__init__()
+        self.class_num = class_num
+        self.weight_mat = weight_mat
+        assert s > 0
+        self.s = s
+        self.weight = weight
+
+    def forward(self, x, target):
+        index = torch.zeros_like(x, dtype=torch.uint8)
+        index.scatter_(1, target.data.view(-1, 1), 1)
+
+        index_float = index.type(torch.cuda.FloatTensor)
+        batch_m = torch.matmul(self.weight_mat, index_float.transpose(0,1))
+        batch_m = batch_m.view((-1, self.class_num))
+        # x_m 即x+delta之后的矩阵
+        x_m = x + batch_m
+        
+        output = torch.where(index, x, x_m)
+
+        return F.cross_entropy(self.s*output, target, weight=self.weight)
