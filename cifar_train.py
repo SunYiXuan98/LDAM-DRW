@@ -75,11 +75,12 @@ parser.add_argument('--root_log', type=str, default='log')
 parser.add_argument('--root_model', type=str, default='checkpoint')
 
 parser.add_argument('--visual', type=bool, default=False)
+parser.add_argument('--soft_topk', type=int, default=0)
+args = parser.parse_args()
 best_acc1 = 0
-
+num_classes = 100 if args.dataset == 'cifar100' else 10
 
 def main():
-    args = parser.parse_args()
     args.store_name = '_'.join([args.dataset, args.arch, args.loss_type, args.train_rule, args.imb_type, str(args.imb_factor), args.exp_str])
     prepare_folders(args)
     if args.seed is not None:
@@ -109,7 +110,6 @@ def main_worker(gpu, ngpus_per_node, args):
 
     # create model
     print("=> creating model '{}'".format(args.arch))
-    num_classes = 100 if args.dataset == 'cifar100' else 10
     use_norm = True if args.loss_type == 'LDAM' else False
     model = models.__dict__[args.arch](num_classes=num_classes, use_norm=use_norm)
 
@@ -129,6 +129,11 @@ def main_worker(gpu, ngpus_per_node, args):
         if os.path.isfile(args.resume):
             print("=> loading checkpoint '{}'".format(args.resume))
             checkpoint = torch.load(args.resume, map_location='cuda:0')
+            if(args.visual):
+                fc_w = checkpoint['state_dict']['module.linear.weight']
+                norm_w = torch.norm(fc_w, dim=1)
+                print(norm_w)
+                checkpoint['state_dict']['module.linear.weight'] = fc_w / norm_w[:, None]
             args.start_epoch = checkpoint['epoch']
             best_acc1 = checkpoint['best_acc1']
             if args.gpu is not None:
@@ -157,12 +162,16 @@ def main_worker(gpu, ngpus_per_node, args):
         transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
     ])
 
+
+    
     if args.dataset == 'cifar10':
         train_dataset = IMBALANCECIFAR10(root='./data', imb_type=args.imb_type, imb_factor=args.imb_factor, rand_number=args.rand_number, train=True, download=True, transform=transform_train)
         val_dataset = datasets.CIFAR10(root='./data', train=False, download=True, transform=transform_val)
+    
     elif args.dataset == 'cifar100':
         train_dataset = IMBALANCECIFAR100(root='./data', imb_type=args.imb_type, imb_factor=args.imb_factor, rand_number=args.rand_number, train=True, download=True, transform=transform_train)
         val_dataset = datasets.CIFAR100(root='./data', train=False, download=True, transform=transform_val)
+        
     else:
         warnings.warn('Dataset is not listed')
         return
@@ -180,13 +189,19 @@ def main_worker(gpu, ngpus_per_node, args):
     val_loader = torch.utils.data.DataLoader(
         val_dataset, batch_size=100, shuffle=False,
         num_workers=args.workers, pin_memory=True)
+    
 
     # init log for training
-    log_training = open(os.path.join(args.root_log, args.store_name, 'log_train.csv'), 'w')
-    log_testing = open(os.path.join(args.root_log, args.store_name, 'log_test.csv'), 'w')
-    with open(os.path.join(args.root_log, args.store_name, 'args.txt'), 'w') as f:
-        f.write(str(args))
-    tf_writer = SummaryWriter(log_dir=os.path.join(args.root_log, args.store_name))
+    if(args.visual):
+        log_training = log_testing = tf_writer = None
+    else:
+        log_training = open(os.path.join(args.root_log, args.store_name, 'log_train.csv'), 'w')
+        log_testing = open(os.path.join(args.root_log, args.store_name, 'log_test.csv'), 'w')
+        with open(os.path.join(args.root_log, args.store_name, 'args.txt'), 'w') as f:
+            f.write(str(args))
+        tf_writer = SummaryWriter(log_dir=os.path.join(args.root_log, args.store_name))
+    
+
     for epoch in range(args.start_epoch, args.epochs):
         adjust_learning_rate(optimizer, epoch, args)
 
@@ -214,7 +229,6 @@ def main_worker(gpu, ngpus_per_node, args):
         else:
             warnings.warn('Sample rule is not listed')
         
-
 
         # CHOOSE LOSS
         np_num_list = np.array(cls_num_list)
@@ -245,11 +259,12 @@ def main_worker(gpu, ngpus_per_node, args):
             criterion = SigLoss(class_num=num_classes, weight_mat=weight_mat).cuda(args.gpu)
         elif args.loss_type == 'Soft':
             # structure
+            weight_mat = np.ones(shape=(num_classes, num_classes))
             for i in range(num_classes):
-                eps = (np.sum(cf_mat[i]) - cf_mat[i][i]) / (num_classes - 1)
-                # eps = 1
-                weight_mat[i] = (cf_mat[i] + eps) / (np.sum(cf_mat[i] + eps) - (cf_mat[i][i] + eps))
-                weight_mat[i][i] = 0
+                cf_mat[i][i] = 0
+                index_topk = cf_mat[i].argsort()[-args.soft_topk:][::-1]
+                for j,idx in enumerate(index_topk):
+                    weight_mat[i][idx] = np.e * (args.soft_topk - j)
 
             # imbalanced
             # for i in range(num_classes):
@@ -300,6 +315,7 @@ def main_worker(gpu, ngpus_per_node, args):
         
         # evaluate on validation set
         acc1 = validate(val_loader, model, criterion, epoch, args, log_testing, tf_writer)
+        # acc1 = validate(train_loader, model, criterion, epoch, args, log_testing, tf_writer)
 
         # remember best acc@1 and save checkpoint
         if(not args.visual):
@@ -332,6 +348,7 @@ def train(train_loader, model, criterion, optimizer, epoch, args, log, tf_writer
     model.train()
 
     end = time.time()
+    
     for i, (input, target) in enumerate(train_loader):
         # measure data loading time
         data_time.update(time.time() - end)
@@ -341,7 +358,7 @@ def train(train_loader, model, criterion, optimizer, epoch, args, log, tf_writer
         target = target.cuda(args.gpu, non_blocking=True)
 
         # compute output
-        output = model(input)
+        output, features = model(input)
         loss = criterion(output, target)
 
         # measure accuracy and record loss
@@ -369,9 +386,10 @@ def train(train_loader, model, criterion, optimizer, epoch, args, log, tf_writer
                 epoch, i, len(train_loader), batch_time=batch_time,
                 data_time=data_time, loss=losses, top1=top1, top5=top5, lr=optimizer.param_groups[-1]['lr'] * 0.1))  # TODO
             print(output)
+
             log.write(output + '\n')
             log.flush()
-
+               
     tf_writer.add_scalar('loss/train', losses.avg, epoch)
     tf_writer.add_scalar('acc/train_top1', top1.avg, epoch)
     tf_writer.add_scalar('acc/train_top5', top5.avg, epoch)
@@ -387,7 +405,8 @@ def validate(val_loader, model, criterion, epoch, args, log=None, tf_writer=None
     model.eval()
     all_preds = []
     all_targets = []
-    all_output = []
+    
+    features_classes = [[] for _ in range(num_classes)]
     with torch.no_grad():
         end = time.time()
         for i, (input, target) in enumerate(val_loader):
@@ -396,9 +415,8 @@ def validate(val_loader, model, criterion, epoch, args, log=None, tf_writer=None
             target = target.cuda(args.gpu, non_blocking=True)
 
             # compute output
-            output = model(input)
-            if(args.visual):
-                all_output.extend(F.softmax(output).cpu().numpy())
+            output, features = model(input)
+
             loss = criterion(output, target)
 
             # measure accuracy and record loss
@@ -413,7 +431,11 @@ def validate(val_loader, model, criterion, epoch, args, log=None, tf_writer=None
 
             _, pred = torch.max(output, 1)
             all_preds.extend(pred.cpu().numpy())
-            all_targets.extend(target.cpu().numpy())
+            all_targets.extend(target.cpu().numpy()) 
+
+            if(args.visual):
+                for i in range(features.shape[0]):
+                    features_classes[target[i]].append(features[i].cpu().numpy())
 
             if i % args.print_freq == 0:
                 output = ('Test: [{0}/{1}]\t'
@@ -426,18 +448,6 @@ def validate(val_loader, model, criterion, epoch, args, log=None, tf_writer=None
                 print(output)
         
         cf = confusion_matrix(all_targets, all_preds).astype(float)
-        if(args.visual):
-            prob_mat = np.zeros_like(cf)
-            print(all_targets[:5])
-            print(all_output[:5])
-            for i,prob in enumerate(all_output):
-                prob_mat[all_targets[i]] += prob
-            print('prob:')
-            print(prob_mat.astype(int))
-            print('cf:')
-            print(cf.astype(int))
-        if(epoch % 5 == 0):
-            print(cf)
 
         cls_cnt = cf.sum(axis=1)
         cls_hit = np.diag(cf)
@@ -448,16 +458,31 @@ def validate(val_loader, model, criterion, epoch, args, log=None, tf_writer=None
         print(output)
         print(out_cls_acc)
 
-        if(not args.visual):
-            if log is not None:
-                log.write(output + '\n')
-                log.write(out_cls_acc + '\n')
-                log.flush()
+        if(args.visual):
+            print('cf:')
+            print(cf.astype(int))
+            for i in range(num_classes):
+                np_features_class = np.array(features_classes[i])
+                i_mean = np.mean(np_features_class, axis=0)
+                i_dist = np_features_class - i_mean
+                i_dist = np.linalg.norm(i_dist, axis=1)
+                mean_dist = np.mean(i_dist)
+                # median_dist = np.median(i_dist)
+                print(i, mean_dist)
+            exit(0)
 
-            tf_writer.add_scalar('loss/test_'+ flag, losses.avg, epoch)
-            tf_writer.add_scalar('acc/test_' + flag + '_top1', top1.avg, epoch)
-            tf_writer.add_scalar('acc/test_' + flag + '_top5', top5.avg, epoch)
-            tf_writer.add_scalars('acc/test_' + flag + '_cls_acc', {str(i):x for i, x in enumerate(cls_acc)}, epoch)
+        if(epoch % 5 == 0):
+            print(cf)
+
+        if log is not None:
+            log.write(output + '\n')
+            log.write(out_cls_acc + '\n')
+            log.flush()
+            
+        tf_writer.add_scalar('loss/test_'+ flag, losses.avg, epoch)
+        tf_writer.add_scalar('acc/test_' + flag + '_top1', top1.avg, epoch)
+        tf_writer.add_scalar('acc/test_' + flag + '_top5', top5.avg, epoch)
+        tf_writer.add_scalars('acc/test_' + flag + '_cls_acc', {str(i):x for i, x in enumerate(cls_acc)}, epoch)
 
     return top1.avg
 

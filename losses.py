@@ -83,18 +83,16 @@ class SoftLoss(nn.Module):
         prob_max = torch.max(logits, 1)[0]
         logits = logits - prob_max[:, None]
         exp_mat = torch.exp(logits)
-        exp_sum = torch.sum(exp_mat, dim=1)
-        prob_mat = exp_mat / exp_sum[:, None]
 
-        batch_weight_mat = np.zeros(prob_mat.shape)
+        batch_weight_mat = np.zeros(exp_mat.shape)
         for i, label in enumerate(labels.cpu().numpy()):
             batch_weight_mat[i] = self.weight_mat[label]
         batch_weight_mat = torch.tensor(batch_weight_mat).float().cuda()
         
-        weights = torch.sum(batch_weight_mat * prob_mat, dim=1) * self.class_num
+        exp_sum = torch.sum(batch_weight_mat * exp_mat, dim=1)
         exp_sum_log = torch.log(exp_sum)
         logits_for_labels = logits[[i for i in range(logits.shape[0])], labels.cpu().numpy()]
-        batch_loss = ((-logits_for_labels + exp_sum_log) * weights).sum()
+        batch_loss = (-logits_for_labels + exp_sum_log).sum()
 
         return batch_loss / len(labels)
         
